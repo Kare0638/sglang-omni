@@ -31,13 +31,17 @@ class SimpleMLP(nn.Module):
 
 
 class SimpleRunner(EncoderRunner):
-    def __init__(self, device: str, dtype: torch.dtype, input_dim: int, output_dim: int):
+    def __init__(
+        self, device: str, dtype: torch.dtype, input_dim: int, output_dim: int
+    ):
         super().__init__(device, dtype)
         self.input_dim = input_dim
         self.output_dim = output_dim
 
     def load(self) -> None:
-        self.model = SimpleMLP(self.input_dim, self.output_dim).to(self.device, self.dtype)
+        self.model = SimpleMLP(self.input_dim, self.output_dim).to(
+            self.device, self.dtype
+        )
         self.model.eval()
 
     def prepare(self, requests: list[Request]) -> torch.Tensor:
@@ -47,7 +51,9 @@ class SimpleRunner(EncoderRunner):
     def forward(self, batch: torch.Tensor) -> torch.Tensor:
         return self.model(batch)
 
-    def unbatch(self, requests: list[Request], output: torch.Tensor) -> list[torch.Tensor]:
+    def unbatch(
+        self, requests: list[Request], output: torch.Tensor
+    ) -> list[torch.Tensor]:
         return [output[i].cpu() for i in range(len(requests))]
 
 

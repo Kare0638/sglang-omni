@@ -109,7 +109,9 @@ class ShutdownMessage:
 
 def parse_message(
     d: dict[str, Any],
-) -> DataReadyMessage | AbortMessage | CompleteMessage | SubmitMessage | ShutdownMessage:
+) -> (
+    DataReadyMessage | AbortMessage | CompleteMessage | SubmitMessage | ShutdownMessage
+):
     """Parse a dict into the appropriate message type."""
     msg_type = d.get("type")
     if msg_type == "data_ready":
