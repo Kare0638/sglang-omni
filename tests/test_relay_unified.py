@@ -72,7 +72,7 @@ class TestRelayUnified:
             device0, device1 = _get_device(relay_class, relay_configs[0]), _get_device(
                 relay_class, relay_configs[1]
             )
-            test_tensor = torch.randn(100000, dtype=torch.float32, device=device0)
+            test_tensor = torch.randn(100000, dtype=torch.bfloat16, device=device0)
             original = test_tensor.cpu().clone()
 
             readable_op = connector0.put([Descriptor(test_tensor)])
@@ -105,7 +105,20 @@ class TestRelayUnified:
                         asyncio.run(coro)
 
             received = _get_received_data(relay_class, read_op, buffer)
-            assert torch.allclose(original, received, rtol=1e-5, atol=1e-5)
+
+            assert (
+                original.shape == received.shape
+            ), f"Shape mismatch: {original.shape} vs {received.shape}"
+            assert (
+                original.dtype == received.dtype
+            ), f"Dtype mismatch: {original.dtype} vs {received.dtype}"
+            assert torch.allclose(
+                original, received, rtol=1e-5, atol=1e-5
+            ), f"Data mismatch: max diff = {torch.max(torch.abs(original - received)).item()}"
+
+            assert not torch.isnan(received).any(), "Received data contains NaN"
+            assert not torch.isinf(received).any(), "Received data contains Inf"
+
             assert connector0._metrics["puts"] >= 1
             assert connector1._metrics["gets"] >= 1
         finally:
@@ -119,7 +132,7 @@ class TestRelayUnified:
             device0, device1 = _get_device(relay_class, relay_configs[0]), _get_device(
                 relay_class, relay_configs[1]
             )
-            test_tensor = torch.randn(100000, dtype=torch.float32, device=device0)
+            test_tensor = torch.randn(100000, dtype=torch.bfloat16, device=device0)
             original = test_tensor.cpu().clone()
 
             readable_op = await connector0.put_async([Descriptor(test_tensor)])
@@ -145,7 +158,21 @@ class TestRelayUnified:
 
             buffer = buffer if relay_class.__name__ != "SHMRelay" else None
             received = _get_received_data(relay_class, read_op, buffer)
-            assert torch.allclose(original, received, rtol=1e-5, atol=1e-5)
+
+            # 详细的数据一致性检查
+            assert (
+                original.shape == received.shape
+            ), f"Shape mismatch: {original.shape} vs {received.shape}"
+            assert (
+                original.dtype == received.dtype
+            ), f"Dtype mismatch: {original.dtype} vs {received.dtype}"
+            assert torch.allclose(
+                original, received, rtol=1e-5, atol=1e-5
+            ), f"Data mismatch: max diff = {torch.max(torch.abs(original - received)).item()}"
+
+            # 验证数据完整性：检查是否有NaN或Inf
+            assert not torch.isnan(received).any(), "Received data contains NaN"
+            assert not torch.isinf(received).any(), "Received data contains Inf"
         finally:
             connector0.close()
             connector1.close()
