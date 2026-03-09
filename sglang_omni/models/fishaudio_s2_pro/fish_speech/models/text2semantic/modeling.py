@@ -1,7 +1,7 @@
 """
 FishQwen3 models following HuggingFace conventions.
 
-This module contains the model implementations with proper separation:
+This module contains the model implementations:
 - FishQwen3Model: Base transformer without any head
 - FishQwen3ForCausalLM: For language modeling
 - FishQwen3OmniForCausalLM: Omni model for causal language modeling with audio
@@ -13,13 +13,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 # liger_kernel removed for inference
 from torch import Tensor
 from torch.nn import functional as F
-from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.configuration import (
@@ -388,245 +386,17 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(x1) * x3)
 
 
-class MoeFusedLinear(nn.Module):
-    """Fused linear layer for Mixture of Experts using torch._grouped_mm."""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        num_experts: int,
-    ) -> None:
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.num_experts = num_experts
-        self.weight = nn.Parameter(
-            torch.empty((num_experts, out_features, in_features))
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        # Kaiming uniform on in_features
-        # Although Qwen's default activation is silu, we set the gain `a = sqrt(5)` following the original Linear
-        in_features = self.weight.shape[-1]
-        bound = math.sqrt(3 * 5 / in_features)
-        nn.init.uniform_(self.weight, -bound, bound)
-
-    def forward(
-        self,
-        input: torch.Tensor,
-        m_sizes: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if offsets is None:
-            offsets = torch.cumsum(m_sizes, dim=0, dtype=torch.int32)
-        input_bf16 = input.bfloat16().contiguous()
-        weight_t = self.weight.bfloat16().transpose(-2, -1).contiguous()
-        output = torch._grouped_mm(input_bf16, weight_t, offs=offsets)
-        return output.to(input.dtype)
-
-    def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, num_experts={self.num_experts}"
-
-
-class MoE(nn.Module):
-    """Mixture of Experts module."""
-
-    def __init__(self, config):
-        super().__init__()
-
-        self.config = config
-        self.num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
-        self.use_aux_loss_free = config.use_aux_loss_free
-        self.gamma = config.router_gamma
-
-        # gating
-        self.gate = nn.Linear(config.dim, config.num_experts, bias=False)
-        self.gate_proj = MoeFusedLinear(
-            config.dim, config.moe_intermediate_size, config.num_experts
-        )
-        self.up_proj = MoeFusedLinear(
-            config.dim, config.moe_intermediate_size, config.num_experts
-        )
-        self.down_proj = MoeFusedLinear(
-            config.moe_intermediate_size, config.dim, config.num_experts
-        )
-
-        # Aux-loss-free expert bias buffer
-        if self.use_aux_loss_free:
-            self.register_buffer(
-                "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32)
-            )
-            # Non-persistent buffer for counting tokens per expert (avoid graph breaks)
-            self.register_buffer(
-                "_expert_counts",
-                torch.zeros(config.num_experts, dtype=torch.float32),
-                persistent=False,
-            )
-
-    @torch.amp.autocast(device_type="cuda", enabled=False)
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        expert_indices: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for MoE layer.
-
-        Args:
-            hidden_states: Input tensor of shape (sequence_length, hidden_dim)
-            expert_indices: Optional tensor of shape (sequence_length, top_k) containing
-                            pre-determined expert indices for replay. If provided, the
-                            routing decision is replayed instead of computed from gate.
-
-        Returns:
-            Tuple of:
-                - output: Output tensor of shape (sequence_length, hidden_dim)
-                - router_logits: Router logits of shape (sequence_length, num_experts)
-                - expert_indices_out: Selected expert indices of shape (sequence_length, top_k)
-        """
-
-        input_dtype = hidden_states.dtype
-        sequence_length, hidden_dim = hidden_states.shape
-
-        # FP32 router
-        router_logits = F.linear(
-            hidden_states.to(torch.float32),
-            self.gate.weight.to(torch.float32),
-            bias=(
-                self.gate.bias.to(torch.float32) if self.gate.bias is not None else None
-            ),
-        )
-
-        if self.use_aux_loss_free:
-            # Aux-loss-free mode: use sigmoid and add expert_bias for selection
-            routing_weights = torch.sigmoid(router_logits)
-            selection_scores = routing_weights + self.expert_bias
-        else:
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            selection_scores = routing_weights
-
-        if expert_indices is not None:
-            # Replay mode: use provided expert indices
-            selected_experts = expert_indices  # (sequence_length, top_k)
-        else:
-            # Normal mode: select top-k experts based on selection_scores
-            _, selected_experts = torch.topk(selection_scores, self.top_k, dim=-1)
-
-        # Gather the routing weights for the selected experts
-        routing_weights = torch.gather(routing_weights, 1, selected_experts)
-
-        # Store the expert indices before reshaping for return
-        expert_indices_out = selected_experts.clone()  # (sequence_length, top_k)
-
-        # Update expert bias during training (aux-loss-free mode)
-        if self.use_aux_loss_free and self.training and expert_indices is None:
-            self._update_bias(expert_indices_out, sequence_length)
-
-        if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-        assert (
-            routing_weights.dtype == torch.float32
-        ), "Routing weights must be in float32"
-
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(input_dtype)
-
-        hidden_states = hidden_states.unsqueeze(1).expand(
-            sequence_length, self.top_k, hidden_dim
-        )
-        # hidden_states must be contiguous
-        hidden_states = hidden_states.reshape(sequence_length * self.top_k, hidden_dim)
-        selected_experts = selected_experts.view(sequence_length * self.top_k)
-
-        # Sort selected_experts and hidden_states for better memory coalescence of weight
-        sort_idx = torch.argsort(selected_experts, stable=True)
-        inv_sort_idx = torch.argsort(sort_idx)
-        hidden_states = hidden_states[sort_idx]
-
-        # Compute num_tokens_per_expert (m_sizes) and offsets
-        m_sizes = torch.histc(
-            selected_experts.float(), bins=self.num_experts, min=0, max=self.num_experts
-        ).int()
-        offsets = torch.cumsum(m_sizes, dim=0, dtype=torch.int32)
-
-        hidden_states = self.forward_mlp(hidden_states, m_sizes, offsets)
-
-        hidden_states = hidden_states[inv_sort_idx]
-
-        hidden_states = hidden_states.view(sequence_length, self.top_k, hidden_dim)
-        hidden_states = torch.einsum("beo,be->bo", hidden_states, routing_weights)
-
-        return hidden_states, router_logits, expert_indices_out
-
-    def forward_mlp(self, hidden_states, m_sizes, offsets):
-        # It's possible to fuse gate_h and up_h, but this affects the shape of LoRA
-        gate_h = self.gate_proj(hidden_states, m_sizes, offsets)
-        up_h = self.up_proj(hidden_states, m_sizes, offsets)
-        hidden_states = F.silu(gate_h) * up_h
-        del gate_h, up_h
-        hidden_states = self.down_proj(hidden_states, m_sizes, offsets)
-        return hidden_states
-
-    @torch.no_grad()
-    def _update_bias(self, topk_indices, local_tokens):
-        """Update expert bias for aux-loss-free load balancing."""
-        # Count tokens per expert (local) using pre-registered buffer
-        self._expert_counts.zero_()
-        flat_indices = topk_indices.view(-1)
-        self._expert_counts.scatter_add_(
-            0,
-            flat_indices,
-            torch.ones_like(flat_indices, dtype=self._expert_counts.dtype),
-        )
-
-        # All-reduce across all ranks to get global counts
-        if dist.is_initialized():
-            dist.all_reduce(self._expert_counts, op=dist.ReduceOp.SUM)
-            # Also need global token count
-            total_tokens = torch.tensor(
-                [local_tokens * self.top_k], device=self._expert_counts.device
-            )
-            dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
-        else:
-            total_tokens = local_tokens * self.top_k
-
-        # Expected tokens per expert (uniform)
-        expected = total_tokens / self.num_experts
-
-        # Update bias: decrease for overloaded, increase for underloaded
-        overloaded = self._expert_counts > expected
-        underloaded = self._expert_counts < expected
-
-        self.expert_bias[overloaded] -= self.gamma
-        self.expert_bias[underloaded] += self.gamma
-
-        # Broadcast expert_bias from rank 0 to ensure consistency
-        if dist.is_initialized():
-            dist.broadcast(self.expert_bias, src=0)
-
-
 class TransformerBlock(nn.Module):
     """Transformer block with attention and feed-forward."""
 
     def __init__(self, config: FishQwen3Config) -> None:
         super().__init__()
         self.attention = Attention(config)
-
-        if config.use_moe:
-            self.feed_forward = MoE(config)
-        else:
-            self.feed_forward = FeedForward(
-                dim=config.dim, intermediate_size=config.intermediate_size
-            )
-
+        self.feed_forward = FeedForward(
+            dim=config.dim, intermediate_size=config.intermediate_size
+        )
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
-        self.use_moe = config.use_moe
 
     def forward(
         self,
@@ -634,74 +404,28 @@ class TransformerBlock(nn.Module):
         freqs_cis: Tensor,
         cumsum_lengths: Optional[Tensor] = None,
         max_length: Optional[int] = None,
-        expert_indices: Optional[Tensor] = None,
-    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        """
-        Forward pass.
-
-        Args:
-            x: Input tensor (batch_size, seq_len, dim) or (seq_len, dim)
-            freqs_cis: RoPE frequencies (seq_len, head_dim)
-            cumsum_lengths: Cumulative sequence lengths (optional)
-            max_length: Maximum sequence length (optional)
-            expert_indices: Optional expert indices for MoE replay (seq_len, top_k)
-
-        Returns:
-            If not use_moe: output tensor
-            If use_moe: tuple of (output, router_logits, expert_indices)
-        """
+    ) -> Tensor:
         h = x + self.attention(
             self.attention_norm(x),
             freqs_cis=freqs_cis,
             cumsum_lengths=cumsum_lengths,
             max_length=max_length,
         )
-
-        if not self.use_moe:
-            return h + self.feed_forward(self.ffn_norm(h))
-
-        out, router_logits, expert_indices_out = self.feed_forward(
-            self.ffn_norm(h), expert_indices=expert_indices
-        )
-        return h + out, router_logits, expert_indices_out
+        return h + self.feed_forward(self.ffn_norm(h))
 
     def forward_kvcached(
         self,
         x: Tensor,
         freqs_cis: Tensor,
         cache_seqlens: Tensor,
-        expert_indices: Optional[Tensor] = None,
-    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        """
-        Forward pass with KV cache for autoregressive generation.
-
-        Args:
-            x: Input tensor (batch_size, seq_len, dim)
-            freqs_cis: RoPE frequencies (seq_len, head_dim)
-            cache_seqlens: Current sequence lengths in the KV cache (batch_size,)
-            expert_indices: Optional expert indices for MoE replay (batch_size * seq_len, top_k)
-
-        Returns:
-            If not use_moe: output tensor (batch_size, seq_len, dim)
-            If use_moe: tuple of (output, router_logits, expert_indices)
-        """
+        **kwargs,
+    ) -> Tensor:
         h = x + self.attention.forward_kvcached(
             self.attention_norm(x),
             freqs_cis=freqs_cis,
             cache_seqlens=cache_seqlens,
         )
-
-        if not self.use_moe:
-            return h + self.feed_forward(self.ffn_norm(h))
-
-        # For MoE, we need to handle the 3D input shape
-        bsz, seqlen, dim = h.shape
-        h_flat = self.ffn_norm(h).view(bsz * seqlen, dim)
-        out, router_logits, expert_indices_out = self.feed_forward(
-            h_flat, expert_indices=expert_indices
-        )
-        out = out.view(bsz, seqlen, dim)
-        return h + out, router_logits, expert_indices_out
+        return h + self.feed_forward(self.ffn_norm(h))
 
 
 # ============================================================================
@@ -1763,10 +1487,8 @@ class FishQwen3OmniForCausalLM(FishQwen3PreTrainedModel):
 # Register models with AutoModel/AutoConfig for automatic loading
 # ============================================================================
 
-# Register configs
 AutoConfig.register("fish_qwen3", FishQwen3Config)
 AutoConfig.register("fish_qwen3_omni", FishQwen3OmniConfig)
 
-# Register models
 AutoModel.register(FishQwen3Config, FishQwen3ForCausalLM)
 AutoModel.register(FishQwen3OmniConfig, FishQwen3OmniForCausalLM)

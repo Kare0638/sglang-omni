@@ -1,13 +1,9 @@
 """
 FishQwen3 models with HuggingFace-style interface.
-
-This module provides a clean separation between model architecture and loading logic,
-following HuggingFace conventions while maintaining compatibility with existing code.
 """
 
 from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.configuration import (
     FishQwen3AudioDecoderConfig,
-    FishQwen3AudioEncoderConfig,
     FishQwen3Config,
     FishQwen3OmniConfig,
 )
@@ -24,7 +20,6 @@ __all__ = [
     # Configurations
     "FishQwen3Config",
     "FishQwen3AudioDecoderConfig",
-    "FishQwen3AudioEncoderConfig",
     "FishQwen3OmniConfig",
     # Models
     "FishQwen3Model",
