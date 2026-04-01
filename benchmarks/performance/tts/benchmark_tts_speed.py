@@ -136,8 +136,23 @@ class RequestFuncOutput:
     error: str = ""
 
 
-def parse_meta_lst(path: str, max_samples: int | None = None) -> list[dict]:
-    """Parse a seed-tts-eval meta.lst file (format: id|ref_text|ref_audio_path|text)."""
+_RANDOM_SAMPLE_SEED = 42
+
+
+def parse_meta_lst(
+    path: str,
+    max_samples: int | None = None,
+    random_sample: bool = False,
+) -> list[dict]:
+    """Parse a seed-tts-eval meta.lst file (format: id|ref_text|ref_audio_path|text).
+
+    By default, samples are taken sequentially from the beginning of the file.
+    When ``random_sample=True``, the full list is shuffled with a fixed seed
+    before truncation, ensuring reproducible and unbiased sampling.  Using the
+    same flag across different values of ``max_samples`` produces nested sample
+    sets (e.g. the N=20 set is always a superset of the N=6 set), which makes
+    cross-N comparisons meaningful.
+    """
     base_dir = os.path.dirname(path)
     samples: list[dict] = []
     with open(path) as f:
@@ -156,8 +171,17 @@ def parse_meta_lst(path: str, max_samples: int | None = None) -> list[dict]:
                     "text": fields[3],
                 }
             )
-            if max_samples and len(samples) >= max_samples:
+            if not random_sample and max_samples and len(samples) >= max_samples:
                 break
+
+    if random_sample:
+        import random
+
+        random.Random(_RANDOM_SAMPLE_SEED).shuffle(samples)
+
+    if max_samples:
+        samples = samples[:max_samples]
+
     return samples
 
 
@@ -535,7 +559,7 @@ async def benchmark(args: argparse.Namespace) -> None:
         logger.error("Testset not found: %s", args.testset)
         return
 
-    samples = parse_meta_lst(args.testset, args.max_samples)
+    samples = parse_meta_lst(args.testset, args.max_samples, args.random_sample)
     requests_list = _build_requests(samples, api_url, args)
     logger.info("Prepared %d requests", len(requests_list))
 
@@ -711,6 +735,15 @@ def main() -> None:
         "--stream",
         action="store_true",
         help="Send requests with stream=true (SSE audio chunks).",
+    )
+    parser.add_argument(
+        "--random-sample",
+        action="store_true",
+        help=(
+            "Shuffle the testset with a fixed seed before sampling. "
+            "Produces unbiased, reproducible samples; nested across N values "
+            "when the same flag is used. Default: sequential (first N lines)."
+        ),
     )
     parser.add_argument("--disable-tqdm", action="store_true")
     args = parser.parse_args()
