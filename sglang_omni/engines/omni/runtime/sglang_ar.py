@@ -581,6 +581,26 @@ class SGLangModelRunner:
             consumed = req._omni_consumed or {}
             chunk_offsets: dict[str, tuple[int, int]] = {}
 
+            if logger.isEnabledFor(logging.INFO):
+                image_embeds = omni_inputs.get("image_embeds")
+                video_embeds = omni_inputs.get("video_embeds")
+                audio_embeds = omni_inputs.get("audio_embeds")
+                logger.info(
+                    "MM inject start rid=%s chunked=%s extend_len=%s "
+                    "image_tokens=%s video_tokens=%s audio_tokens=%s "
+                    "image_embeds=%s video_embeds=%s audio_embeds=%s consumed=%s",
+                    req.rid,
+                    getattr(req, "is_chunked", None),
+                    int(end - start),
+                    int((req_input_ids == image_token_id).sum().item()),
+                    int((req_input_ids == video_token_id).sum().item()),
+                    int((req_input_ids == audio_token_id).sum().item()),
+                    None if image_embeds is None else tuple(image_embeds.shape),
+                    None if video_embeds is None else tuple(video_embeds.shape),
+                    None if audio_embeds is None else tuple(audio_embeds.shape),
+                    dict(consumed),
+                )
+
             for modality, token_id in [
                 ("image", image_token_id),
                 ("video", video_token_id),
@@ -602,6 +622,15 @@ class SGLangModelRunner:
                 )
                 input_embeds[torch.where(mask)[0] + start] = chunk_embeds
                 consumed[modality] = offset + n_tokens
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(
+                        "MM inject apply rid=%s modality=%s offset=%s n_tokens=%s next_offset=%s",
+                        req.rid,
+                        modality,
+                        offset,
+                        n_tokens,
+                        consumed[modality],
+                    )
 
             req._omni_consumed = consumed
 
@@ -672,6 +701,13 @@ class SGLangModelRunner:
                     visual_pos_masks_list.append(global_mask)
 
             if req.is_chunked == 0:
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(
+                        "MM inject cleanup rid=%s clear_inputs=%s clear_consumed=%s",
+                        req.rid,
+                        req.omni_model_inputs is not None,
+                        req._omni_consumed is not None,
+                    )
                 req.omni_model_inputs = None
                 req._omni_consumed = None
 

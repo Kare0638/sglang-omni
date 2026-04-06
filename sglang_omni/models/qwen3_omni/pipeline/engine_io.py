@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -12,6 +13,9 @@ from sglang_omni.models.qwen3_omni.io import PipelineState, ThinkerOutput
 
 if TYPE_CHECKING:
     from sglang_omni.engines.omni.runtime.sglang_ar import SGLangARRequestData
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_encoder_request(
@@ -229,6 +233,30 @@ def build_sglang_thinker_request(
     # Always initialize both attributes so downstream code can access directly.
     req.omni_model_inputs = model_inputs if model_inputs else None
     req._omni_consumed = None
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "Build thinker req rid=%s prompt_len=%s has_mm=%s mm_keys=%s "
+            "image_embeds=%s video_embeds=%s audio_embeds=%s image_grid=%s video_grid=%s",
+            rid,
+            len(input_ids_list),
+            bool(model_inputs),
+            sorted(model_inputs.keys()) if model_inputs else [],
+            None
+            if model_inputs.get("image_embeds") is None
+            else tuple(model_inputs["image_embeds"].shape),
+            None
+            if model_inputs.get("video_embeds") is None
+            else tuple(model_inputs["video_embeds"].shape),
+            None
+            if model_inputs.get("audio_embeds") is None
+            else tuple(model_inputs["audio_embeds"].shape),
+            None
+            if model_inputs.get("image_grid_thw") is None
+            else tuple(model_inputs["image_grid_thw"].shape),
+            None
+            if model_inputs.get("video_grid_thw") is None
+            else tuple(model_inputs["video_grid_thw"].shape),
+        )
 
     # Build SGLangARRequestData — output_ids points to req.output_ids
     data = SGLangARRequestData(
