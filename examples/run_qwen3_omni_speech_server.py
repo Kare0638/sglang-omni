@@ -47,6 +47,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path", type=str, default="Qwen/Qwen3-Omni-30B-A3B-Instruct"
     )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for the SGLang-backed Qwen3 thinker",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Optional SGLang quantization mode for the thinker",
+    )
+    parser.add_argument(
+        "--cpu-offload-gb",
+        type=float,
+        default=None,
+        help="CPU offload size in GB for the thinker model",
+    )
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=None,
+        help="Static GPU memory fraction reserved by the thinker backend",
+    )
 
     # GPU placement
     parser.add_argument("--gpu-thinker", type=int, default=0)
@@ -77,6 +101,16 @@ async def main_async(args: argparse.Namespace) -> None:
     from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
     from sglang_omni.serve.openai_api import create_app
 
+    overrides = {}
+    if args.tp_size and args.tp_size > 1:
+        overrides["tp_size"] = args.tp_size
+    if args.quantization:
+        overrides["quantization"] = args.quantization
+    if args.cpu_offload_gb:
+        overrides["cpu_offload_gb"] = args.cpu_offload_gb
+    if args.mem_fraction_static is not None:
+        overrides["mem_fraction_static"] = args.mem_fraction_static
+
     # Build GPU placement from CLI args
     gpu_placement = {
         "thinker": args.gpu_thinker,
@@ -89,6 +123,7 @@ async def main_async(args: argparse.Namespace) -> None:
         model_path=args.model_path,
         relay_backend=args.relay_backend,
         gpu_placement=gpu_placement,
+        server_args_overrides=overrides if overrides else None,
     )
 
     runner = MultiProcessPipelineRunner(config)
